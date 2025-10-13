@@ -8,7 +8,7 @@ from ImageProcessing.inference import ImageInferencePipeline
 from ImageProcessing.image_utils import convert_cv_qt, generate_unique_image_id, save_yolo_predictions, save_segmentation_predictions, save_cnn_cropped
 from Interfaces.ODPredict import ODClassifierWrapper
 from Frontend.settings_dialog import SettingsDialog
-from Acquisition.camera_worker import CameraWorker
+from Acquisition.camera_worker_webcam import WebcamWorker
 from ImageProcessing.processing_worker import ProcessingWorker
 from Frontend.image_browser import ImageBrowserWindow
 from ImageProcessing.image_utils import generate_class_colors
@@ -26,6 +26,8 @@ class MainWindow(QWidget):
     exposureRequested = Signal(int)
 
     processRequested = Signal(object, object)
+    segmParamsUpdated = Signal(dict)
+    cnnParamsUpdated = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -55,8 +57,41 @@ class MainWindow(QWidget):
             "spring_spot": 0.3,
             "spring": 0.3,
         }
+        # CNN params (active)
+        self.cnn_params = {
+            "cnn_threshold": 0.5,
+            "debug_show_inputs": False,
+        }
+        # CNN params (active defaults used by Settings and debug toggle)
+        self.cnn_params = {
+            "cnn_threshold": 0.5,
+            "debug_show_inputs": False,
+        }
+        # CNN params (active)
+        self.cnn_params = {
+            "cnn_threshold": 0.5,
+            "debug_show_inputs": False,
+        }
+        # CNN params
+        self.cnn_params = {
+            "cnn_threshold": 0.5,
+        }
 
         """
+        # Segmentation and YOLO params dicts - initialize defaults (used by Settings)
+        self.segm_params = {
+            "confidence_threshold": 0.3,
+            "temperature": 1.5,
+            "min_area": 100,
+        }
+
+        self.yolo_params = {
+            "seal": 0.3,
+            "od": 0.3,
+            "short": 0.3,
+            "spring_spot": 0.3,
+            "spring": 0.3,
+        }
                 # Batch processing related state
         self.batch_images = []
         self.batch_counter = 0
@@ -90,8 +125,15 @@ class MainWindow(QWidget):
         self.toggle_predict_segm = QCheckBox("Enable Segm Prediction")
         self.toggle_predict_segm.setChecked(False)  # Default off
 
+        self.toggle_predict_cnn = QCheckBox("Enable CNN Classification")
+        self.toggle_predict_cnn.setChecked(False)
+
         self.toggle_predict_yolo = QCheckBox("Enable YOLO Prediction")
         self.toggle_predict_yolo.setChecked(False)
+
+        # Debug: show CNN inputs (cropped+resized image and mask) on the right
+        self.debug_cnn_checkbox = QCheckBox("Show CNN inputs")
+        self.debug_cnn_checkbox.setChecked(False)
 
         # Create batch control buttons
         self.capture_batch_button = QPushButton("Capture batch image 1")
@@ -116,9 +158,32 @@ class MainWindow(QWidget):
         self.toggle_save_predictions.setCheckable(True)
         self.toggle_save_predictions.setGeometry(10, 10, 150, 30) 
 
-        # Layout (single main layout only)
+        # Layout: image area with optional right debug panel
         main_layout = QVBoxLayout(self)
-        main_layout.addWidget(self.image_label)
+
+        image_row = QHBoxLayout()
+
+        # Right-side debug panel (hidden by default)
+        self.cnn_debug_panel = QVBoxLayout()
+        self.cnn_img_label = QLabel("CNN img")
+        self.cnn_img_label.setFixedSize(256, 112)  # half of 512x224
+        self.cnn_img_label.setAlignment(Qt.AlignCenter)
+        self.cnn_mask_label = QLabel("CNN mask")
+        self.cnn_mask_label.setFixedSize(256, 112)
+        self.cnn_mask_label.setAlignment(Qt.AlignCenter)
+        right_panel_widget = QVBoxLayout()
+        right_panel_widget.addWidget(self.cnn_img_label)
+        right_panel_widget.addWidget(self.cnn_mask_label)
+
+        # Container widget to be able to hide/show easily
+        from PySide6.QtWidgets import QWidget as _QW
+        self.right_panel_container = _QW()
+        self.right_panel_container.setLayout(right_panel_widget)
+        self.right_panel_container.setVisible(False)
+
+        image_row.addWidget(self.image_label, stretch=3)
+        image_row.addWidget(self.right_panel_container, stretch=2)
+        main_layout.addLayout(image_row)
 
         row1 = QHBoxLayout()
         row1.addWidget(self.live_mode_button)
@@ -126,9 +191,11 @@ class MainWindow(QWidget):
 
         row2 = QHBoxLayout()
         row2.addWidget(self.toggle_predict_segm)
+        row2.addWidget(self.toggle_predict_cnn)
         row2.addWidget(self.toggle_predict_yolo)
         row2.addWidget(self.open_browser_button)
         row2.addWidget(self.settings_button)
+        row2.addWidget(self.debug_cnn_checkbox)
        
 
 
@@ -157,7 +224,11 @@ class MainWindow(QWidget):
         self.reset_batch_button.clicked.connect(self.reset_batch)
 
         self.open_browser_button.clicked.connect(self.open_browser)
+        # Ensure cnn_params exists before connecting debug toggle
+        if not hasattr(self, 'cnn_params') or not isinstance(getattr(self, 'cnn_params'), dict):
+            self.cnn_params = {"cnn_threshold": 0.5, "debug_show_inputs": False}
         self.settings_button.clicked.connect(self.open_settings_dialog)
+        self.debug_cnn_checkbox.toggled.connect(self.on_debug_cnn_toggled)
 
         # Emit our signals from handlers (UI → Worker)
         self.capture_button.clicked.connect(self.on_snap_clicked)
@@ -166,7 +237,7 @@ class MainWindow(QWidget):
 
         # ---------- Threads & Worker ----------
         self.cam_thread = QThread(self)
-        self.camera = CameraWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
+        self.camera = WebcamWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
         self.camera.moveToThread(self.cam_thread)
         self.proc_thread = QThread(self)
         self.processor = ProcessingWorker(
@@ -197,6 +268,10 @@ class MainWindow(QWidget):
         self.processor.processed.connect(self.on_processed)
         self.processor.error.connect(self.on_error)
         self.processor.ready.connect(lambda: print("Processor ready"))
+
+        # UI → Processor params (queued)
+        self.segmParamsUpdated.connect(self.processor.update_segm_params, type=Qt.QueuedConnection)
+        self.cnnParamsUpdated.connect(self.processor.update_cnn_params, type=Qt.QueuedConnection)
 
 
         # Start the threads
@@ -250,9 +325,11 @@ class MainWindow(QWidget):
     @Slot(object)
     def on_frame_captured(self, packet: FramePacket):
         """UI thread: forward to processing worker with current flags."""
+        want_cnn = self.toggle_predict_cnn.isChecked()
+        want_segm = self.toggle_predict_segm.isChecked() or want_cnn  # CNN requires a mask
         flags = ProcessFlags(
-            predict_segm=self.toggle_predict_segm.isChecked(),
-            predict_class=False,  # as per your requirement
+            predict_segm=want_segm,
+            predict_class=want_cnn,
             predict_yolo=self.toggle_predict_yolo.isChecked(),
             live=self.live_mode_button.isChecked(),
         )
@@ -267,11 +344,21 @@ class MainWindow(QWidget):
     def closeEvent(self, event):
         try:
             self.liveStopRequested.emit()
-            # if CameraWorker has shutdown() slot, you can connect & invoke it here
+            # Invoke worker shutdowns if available
+            try:
+                self.camera.shutdown()
+            except Exception:
+                pass
+            try:
+                self.processor.shutdown()
+            except Exception:
+                pass
         except Exception:
             pass
         self.cam_thread.quit()
         self.cam_thread.wait(2000)
+        self.proc_thread.quit()
+        self.proc_thread.wait(2000)
         super().closeEvent(event)
 
 # ---------- Processor → UI ----------
@@ -284,7 +371,37 @@ class MainWindow(QWidget):
         # Update your image and timing overlays
         acq_s = out.acq_ms / 1000.0
         proc_s = out.proc_ms / 1000.0
+        # Map class prediction (0->OK, 1->SHORT) to display text
+        pred_cls = out.results.get('class_prediction', None)
+        if pred_cls is not None:
+            self.current_predicted_class = "SHORT" if int(pred_cls) == 1 else "OK"
+        else:
+            self.current_predicted_class = ""
+
         self.update_image(out.overlay_bgr, out.acq_ms, out.proc_ms)
+
+        # Update CNN debug previews if enabled and provided
+        if self.debug_cnn_checkbox.isChecked():
+            img_np = out.results.get('cnn_input_img_np')
+            mask_np = out.results.get('cnn_input_mask_np')
+            if img_np is not None:
+                pm = convert_cv_qt(img_np, self.cnn_img_label.width(), self.cnn_img_label.height())
+                self.cnn_img_label.setPixmap(pm)
+            else:
+                self.cnn_img_label.clear()
+                self.cnn_img_label.setText("CNN img")
+            if mask_np is not None:
+                # Convert [H,W] -> [H,W,3] grayscale for display
+                if mask_np.ndim == 2:
+                    import numpy as _np
+                    mask_rgb = _np.stack([mask_np * 255] * 3, axis=2).astype('uint8')
+                else:
+                    mask_rgb = mask_np
+                pm2 = convert_cv_qt(mask_rgb, self.cnn_mask_label.width(), self.cnn_mask_label.height())
+                self.cnn_mask_label.setPixmap(pm2)
+            else:
+                self.cnn_mask_label.clear()
+                self.cnn_mask_label.setText("CNN mask")
 
         # Optional saving as in your old code
         if self.toggle_save_predictions.isChecked():
@@ -306,6 +423,7 @@ class MainWindow(QWidget):
         # Housekeeping for single snap
         self._snap_in_progress = False
         self.toggle_predict_segm.setEnabled(True)
+        self.toggle_predict_cnn.setEnabled(True)
         self.toggle_predict_yolo.setEnabled(True)
 
 
@@ -342,6 +460,9 @@ class MainWindow(QWidget):
             self.image_label.setPixmap(blended_pix)
         else:
             self.image_label.setPixmap(qt_img)
+
+        # Keep right panel visibility synced with checkbox
+        self.right_panel_container.setVisible(self.debug_cnn_checkbox.isChecked())
 
 
     @Slot()
@@ -493,12 +614,31 @@ class MainWindow(QWidget):
         return QPixmap.fromImage(out)
 
 
+    @Slot(bool)
+    def on_debug_cnn_toggled(self, enabled: bool):
+        # Update worker param and show/hide panel
+        if not hasattr(self, 'cnn_params') or not isinstance(getattr(self, 'cnn_params'), dict):
+            self.cnn_params = {"cnn_threshold": 0.5, "debug_show_inputs": False}
+        self.cnn_params["debug_show_inputs"] = bool(enabled)
+        self.cnnParamsUpdated.emit(dict(self.cnn_params))
+        self.right_panel_container.setVisible(bool(enabled))
+
+
     def open_settings_dialog(self):
-        dlg = SettingsDialog(segm_params=self.segm_params, yolo_params=self.yolo_params, parent=self)
+        if not hasattr(self, 'cnn_params') or not isinstance(getattr(self, 'cnn_params'), dict):
+            self.cnn_params = {"cnn_threshold": 0.5, "debug_show_inputs": False}
+        dlg = SettingsDialog(segm_params=self.segm_params, yolo_params=self.yolo_params, cnn_params=self.cnn_params, parent=self)
         if dlg.exec() == QDialog.Accepted:
-            new_params = dlg.get_params()
-            self.segm_params.update(new_params)
-            self.yolo_params.update(new_params)
+            segm_updated, yolo_updated, cnn_updated = dlg.get_params()
+            self.segm_params.update(segm_updated)
+            self.yolo_params.update(yolo_updated)
+            self.cnn_params.update(cnn_updated)
+            # Propagate segmentation params to processing pipeline (thread-safe)
+            self.segmParamsUpdated.emit(dict(self.segm_params))
+            self.cnnParamsUpdated.emit(dict(self.cnn_params))
+            # Show/hide right panel based on debug flag
+            dbg = bool(self.cnn_params.get("debug_show_inputs", False))
+            self.right_panel_container.setVisible(dbg)
 
     def open_browser(self):
         if self.image_browser is None or not self.image_browser.isVisible():

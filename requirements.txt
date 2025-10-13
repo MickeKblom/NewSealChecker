@@ -17,3 +17,4 @@ scikit-image
 scikit-learn
 Pillow
 pathlib
+shapely

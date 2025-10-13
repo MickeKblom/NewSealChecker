@@ -51,8 +51,14 @@ class ImageInferencePipeline:
         print(self.backend)
         if self.backend == Backend.TORCH:
             img_t = torch.from_numpy(image_np).to(self.torch_device)
+            # Ensure CHW for downstream tensor utilities
+            if img_t.ndim == 3 and img_t.shape[-1] in (3, 4):
+                img_chw = img_t.permute(2, 0, 1).contiguous()
+            else:
+                img_chw = img_t
 
             if predict_segm:
+                # Segmentation model can accept HWC or CHW; returns [H,W]
                 mask = self.segm_model.perform_segmentation(img_t)
                 mask = mask.to(self.torch_device)
 
@@ -64,11 +70,15 @@ class ImageInferencePipeline:
                 results['segmentation_mask'] = mask
 
                 if predict_class:
+                    # Crop using CHW image and [H,W] mask bbox
                     bbox = mask_to_bbox_torch(mask)
-                    cropped_img = crop_tensor(img_t, bbox)
-                    cropped_mask = crop_tensor(mask.unsqueeze(0), bbox).squeeze(0)
+                    cropped_img = crop_tensor(img_chw, bbox)  # [C,H,W]
+                    cropped_mask = crop_tensor(mask.unsqueeze(0), bbox).squeeze(0)  # [H,W]
 
-                    resized_img = resize_tensor(cropped_img, size=(224, 512), mode='nearest')
+                    # Convert to float prior to bilinear resize
+                    img_for_resize = cropped_img.float() / 255.0 if not cropped_img.dtype.is_floating_point else cropped_img
+                    # Resize to (H,W) = (224,512) as trained: 512x224
+                    resized_img = resize_tensor(img_for_resize, size=(224, 512), mode='bilinear', align_corners=False)
                     resized_mask = resize_tensor(cropped_mask.unsqueeze(0), size=(224, 512), mode='nearest').squeeze(0)
 
                     pred_class = self.classifier.predict(resized_img, resized_mask)
@@ -76,6 +86,9 @@ class ImageInferencePipeline:
                     results['class_prediction'] = pred_class
                     results['cropped_img'] = cropped_img
                     results['cropped_mask'] = cropped_mask
+                    # Keep a copy of the actual CNN inputs (for optional debug visualization)
+                    results['cnn_input_img'] = resized_img  # [C,224,512] float
+                    results['cnn_input_mask'] = resized_mask  # [224,512]
 
             if predict_yolo:
                 detections = self.yolo_model.perform_detection(img_t)

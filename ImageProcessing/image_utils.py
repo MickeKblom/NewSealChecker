@@ -398,6 +398,7 @@ def mask_to_bbox_torch(mask_tensor):
     ymax = pos[:, 0].max().item()
     xmin = pos[:, 1].min().item()
     xmax = pos[:, 1].max().item()
+    return xmin, ymin, xmax, ymax
 
 
 def crop_tensor(tensor, bbox):

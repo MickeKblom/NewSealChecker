@@ -1,6 +1,7 @@
 # Acquisition/processing_worker.py
 import time
 import numpy as np
+import torch
 from PySide6.QtCore import QObject, Signal, Slot
 from ImageProcessing.inference import ImageInferencePipeline
 from types_shared import FramePacket, ProcessFlags, ProcessedResult
@@ -22,6 +23,15 @@ class ProcessingWorker(QObject):
         self._warmup = warmup
         self._pipeline = None
         self._live_running = False  # drop-policy flag
+        self._segm_params = {
+            "confidence_threshold": 0.3,
+            "temperature": 1.5,
+            "min_area": 100,
+        }
+        self._cnn_params = {
+            "cnn_threshold": None,  # None => use checkpoint default
+            "debug_show_inputs": False,
+        }
 
     @Slot()
     def initialize(self):
@@ -33,6 +43,14 @@ class ProcessingWorker(QObject):
                 yolo_model_path=self._yolo_path,
                 device_cfg=self.device_cfg
             )
+            # Apply initial segmentation params
+            try:
+                m = self._pipeline.segm_model
+                m.confidence_threshold = float(self._segm_params["confidence_threshold"])
+                m.temperature = float(self._segm_params["temperature"])
+                m.min_area = int(self._segm_params["min_area"])
+            except Exception:
+                pass
 
             if self._warmup:
                 # Warm-up to load kernels/JIT and reduce first-frame latency
@@ -62,10 +80,7 @@ class ProcessingWorker(QObject):
                 predict_segm=flags.predict_segm,
                 predict_class=flags.predict_class,
                 predict_yolo=flags.predict_yolo,
-                postprocess_enabled=False,  # toggle
-                dilate_kernel=5,
-                dilate_iters=1,
-                smooth_alpha=0.7
+                postprocess_enabled=False,
             )
 
             overlay = frame_packet.image.copy()
@@ -77,6 +92,17 @@ class ProcessingWorker(QObject):
                 overlay = self._pipeline.yolo_model.create_detections_overlay(
                     overlay, results['yolo_detections']
                 )
+
+            # If debug enabled and cropped inputs are present, attach previews (downscaled for UI)
+            if self._cnn_params.get("debug_show_inputs") and results.get('cnn_input_img') is not None:
+                try:
+                    # Ensure on CPU uint8 for safe Qt display
+                    dbg_img = (results['cnn_input_img'].clamp(0, 1) * 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+                    dbg_mask = (results['cnn_input_mask'] > 0).to(torch.uint8).cpu().numpy()
+                    results['cnn_input_img_np'] = dbg_img
+                    results['cnn_input_mask_np'] = dbg_mask
+                except Exception:
+                    pass
 
             t1 = time.perf_counter()
             proc_ms = int((t1 - t0) * 1000) 
@@ -99,3 +125,26 @@ class ProcessingWorker(QObject):
     def shutdown(self):
         # If your frameworks require explicit cleanup, do it here.
         pass
+
+    @Slot(dict)
+    def update_segm_params(self, params: dict):
+        """Update segmentation thresholds and propagate to model on the processing thread."""
+        self._segm_params.update(params or {})
+        try:
+            m = self._pipeline.segm_model
+            m.confidence_threshold = float(self._segm_params.get("confidence_threshold", m.confidence_threshold))
+            m.temperature = float(self._segm_params.get("temperature", m.temperature))
+            m.min_area = int(self._segm_params.get("min_area", m.min_area))
+        except Exception:
+            pass
+
+    @Slot(dict)
+    def update_cnn_params(self, params: dict):
+        self._cnn_params.update(params or {})
+        # Apply threshold override to classifier if provided
+        try:
+            thr = self._cnn_params.get("cnn_threshold", None)
+            if thr is not None and self._pipeline is not None:
+                self._pipeline.classifier.threshold = float(thr)
+        except Exception:
+            pass

@@ -115,13 +115,19 @@ class ImageBrowserWindow(QWidget):
                 predict_yolo=self.toggle_yolo.isChecked()
             )
             if results.get('segmentation_mask') is not None:
-                overlayed_img = self.pipeline.segm_model.create_segmentation_overlay(overlayed_img, results['segmentation_mask'])
+                try:
+                    overlayed_img = self.pipeline.segm_model.create_segmentation_overlay(overlayed_img, results['segmentation_mask'])
+                except Exception:
+                    pass
             if results.get('yolo_detections') is not None:
-                overlayed_img = self.pipeline.yolo_model.create_detection_overlay(overlayed_img, results['yolo_detections'])
+                try:
+                    overlayed_img = self.pipeline.yolo_model.create_detection_overlay(overlayed_img, results['yolo_detections'])
+                except Exception:
+                    pass
         else:
             overlayed_img = frame
 
-        pix = convert_cv_qt(frame, self.image_label.width(), self.image_label.height())
+        pix = convert_cv_qt(overlayed_img, self.image_label.width(), self.image_label.height())
         self.image_label.setPixmap(pix)
         self.status_label.setText(f"Showing image {self.current_index + 1} of {len(self.images)}: {os.path.basename(img_path)}")
 
