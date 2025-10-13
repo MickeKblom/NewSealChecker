@@ -1,0 +1,19 @@
+opencv-python-headless==4.7.0.72
+numpy==1.25.2
+imagingcontrol4
+pyqt5-tools
+pycomm3==1.2.14        # for PLC communication (future)
+#tensorrt
+onnxruntime==1.15.1    # ONNX Runtime support
+pyside6==6.6.3
+torch
+torchvision
+matplotlib
+pycocotools
+segmentation-models-pytorch==0.3.0
+ultralytics
+scipy
+scikit-image
+scikit-learn
+Pillow
+pathlib
