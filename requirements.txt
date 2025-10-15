@@ -1,7 +1,6 @@
 opencv-python-headless==4.7.0.72
 numpy==1.25.2
 imagingcontrol4
-pyqt5-tools
 pycomm3==1.2.14        # for PLC communication (future)
 #tensorrt
 onnxruntime==1.15.1    # ONNX Runtime support

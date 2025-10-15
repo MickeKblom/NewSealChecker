@@ -8,7 +8,9 @@ from ImageProcessing.inference import ImageInferencePipeline
 from ImageProcessing.image_utils import convert_cv_qt, generate_unique_image_id, save_yolo_predictions, save_segmentation_predictions, save_cnn_cropped
 from Interfaces.ODPredict import ODClassifierWrapper
 from Frontend.settings_dialog import SettingsDialog
-from Acquisition.camera_worker_webcam import WebcamWorker
+#from Acquisition.camera_worker_webcam import WebcamWorker
+#from Acquisition.camera_worker import CameraWorker
+from Acquisition.camera_worker_tiscam import TisCameraWorker
 from ImageProcessing.processing_worker import ProcessingWorker
 from Frontend.image_browser import ImageBrowserWindow
 from ImageProcessing.image_utils import generate_class_colors
@@ -237,7 +239,8 @@ class MainWindow(QWidget):
 
         # ---------- Threads & Worker ----------
         self.cam_thread = QThread(self)
-        self.camera = WebcamWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
+        #self.camera = WebcamWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
+        self.camera = TisCameraWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
         self.camera.moveToThread(self.cam_thread)
         self.proc_thread = QThread(self)
         self.processor = ProcessingWorker(
