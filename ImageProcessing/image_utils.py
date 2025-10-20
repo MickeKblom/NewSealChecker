@@ -244,8 +244,14 @@ def save_segmentation_predictions(image_np, mask_np, base_path, image_id):
     ensure_dir(imgs_dir)
     ensure_dir(labels_dir)
 
+    # Convert BGR to RGB for saved images only
+    if image_np.shape[2] == 3:  # If it's a color image
+        image_np_rgb = image_np[:, :, [2, 1, 0]]  # BGR -> RGB
+    else:
+        image_np_rgb = image_np
+    
     # Save image and mask as PNG
-    Image.fromarray(image_np).save(os.path.join(imgs_dir, f"{image_id}.png"))
+    Image.fromarray(image_np_rgb).save(os.path.join(imgs_dir, f"{image_id}.png"))
     
     # Convert tensor to numpy if needed
     if hasattr(mask_np, 'cpu'):  # It's a PyTorch tensor
@@ -318,14 +324,9 @@ def save_segmentation_predictions(image_np, mask_np, base_path, image_id):
     print(f"Saved COCO annotations JSON with {len(coco_json['annotations'])} annotations.")
 
 def save_cnn_cropped(cropped_img_np, cropped_mask_np, base_path, image_id):
-    ensure_dir(os.path.join(base_path, "CNN", "cropped_images"))
-    ensure_dir(os.path.join(base_path, "CNN", "cropped_masks"))
-    ensure_dir(os.path.join(base_path, "CNN", "images"))
-    
-    # Save original cropped image
-    Image.fromarray(cropped_img_np).save(os.path.join(base_path, "CNN", "cropped_images", f"{image_id}.png"))
-    # Save cropped mask
-    Image.fromarray(cropped_mask_np).save(os.path.join(base_path, "CNN", "cropped_masks", f"{image_id}.png"))
+    # This function is now just a placeholder since save_cnn_predictions handles everything
+    # The cropped data is passed directly to save_cnn_predictions which does the proper saving
+    pass
 
 
 def save_cnn_predictions(cnn_input_img, cnn_input_mask, class_prediction, base_path, image_id):
@@ -361,6 +362,12 @@ def save_cnn_predictions(cnn_input_img, cnn_input_mask, class_prediction, base_p
     else:
         mask_np = cnn_input_mask
     
+    # Convert BGR to RGB for saved images only
+    if img_np.shape[2] == 3:  # If it's a color image
+        img_np_rgb = img_np[:, :, [2, 1, 0]]  # BGR -> RGB
+    else:
+        img_np_rgb = img_np
+    
     # Determine folder based on prediction
     folder_name = "OK" if class_prediction == 0 else "shorts"
     
@@ -373,7 +380,7 @@ def save_cnn_predictions(cnn_input_img, cnn_input_mask, class_prediction, base_p
     ensure_dir(masks_dir)
     
     # Save image and mask
-    Image.fromarray(img_np).save(os.path.join(images_dir, f"{image_id}.png"))
+    Image.fromarray(img_np_rgb).save(os.path.join(images_dir, f"{image_id}.png"))
     Image.fromarray(mask_np).save(os.path.join(masks_dir, f"{image_id}.png"))
     
     print(f"Saved CNN prediction to {folder_name} folder: {image_id}.png (prediction: {class_prediction})")
@@ -520,10 +527,6 @@ def crop_to_square_gpu(img_np: np.ndarray, target_size: int = 640) -> np.ndarray
     # Convert back to numpy (CHW -> HWC)
     result = cropped.permute(1, 2, 0).cpu().numpy()
     result = (result * 255).astype(np.uint8)
-    
-    # Convert BGR to RGB for proper color display
-    if result.shape[2] == 3:  # If it's a color image
-        result = result[:, :, [2, 1, 0]]  # BGR -> RGB
     
     return result
 
