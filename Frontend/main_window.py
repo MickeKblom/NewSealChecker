@@ -9,8 +9,8 @@ from ImageProcessing.image_utils import convert_cv_qt, generate_unique_image_id,
 from Interfaces.ODPredict import ODClassifierWrapper
 from Frontend.settings_dialog import SettingsDialog
 #from Acquisition.camera_worker_webcam import WebcamWorker
-#from Acquisition.camera_worker import CameraWorker
-from Acquisition.camera_worker_tiscam import TisCameraWorker
+from Acquisition.camera_worker import CameraWorker
+#from Acquisition.camera_worker_tiscam import CameraWorker
 from ImageProcessing.processing_worker import ProcessingWorker
 from Frontend.image_browser import ImageBrowserWindow
 from ImageProcessing.image_utils import generate_class_colors
@@ -34,52 +34,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         
-        """
-        device_cfg = auto_device()
-
-        self.pipeline = ImageInferencePipeline(
-            segm_model_path="Models/Segmentation/best.pth",
-            cnn_model_path="Models/CNN/best.pth",
-            yolo_model_path="Models/YOLO/best.pt",
-            device_cfg=device_cfg
-        )
-
-                # Segmentation and YOLO params dicts - initialize defaults
-        self.segm_params = {
-            "confidence_threshold": 0.3,
-            "temperature": 1.5,
-            "min_area": 100,
-            # add other segmentation params here as keys with default float values
-        }
-
-        self.yolo_params = {
-            "seal": 0.3,
-            "od": 0.3,
-            "short": 0.3,
-            "spring_spot": 0.3,
-            "spring": 0.3,
-        }
-        # CNN params (active)
-        self.cnn_params = {
-            "cnn_threshold": 0.5,
-            "debug_show_inputs": False,
-        }
-        # CNN params (active defaults used by Settings and debug toggle)
-        self.cnn_params = {
-            "cnn_threshold": 0.5,
-            "debug_show_inputs": False,
-        }
-        # CNN params (active)
-        self.cnn_params = {
-            "cnn_threshold": 0.5,
-            "debug_show_inputs": False,
-        }
-        # CNN params
-        self.cnn_params = {
-            "cnn_threshold": 0.5,
-        }
-
-        """
+       
         # Segmentation and YOLO params dicts - initialize defaults (used by Settings)
         self.segm_params = {
             "confidence_threshold": 0.3,
@@ -240,12 +195,12 @@ class MainWindow(QWidget):
         # ---------- Threads & Worker ----------
         self.cam_thread = QThread(self)
         #self.camera = WebcamWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
-        self.camera = TisCameraWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
+        self.camera = CameraWorker(width=640, height=640, exposure_us=29000, timeout_ms=1000)
         self.camera.moveToThread(self.cam_thread)
         self.proc_thread = QThread(self)
         self.processor = ProcessingWorker(
             segm_model_path="Models/Segmentation/best.pth",
-            cnn_model_path="Models/CNN/best.pth",
+            cnn_model_path="Models/CNN/bestCheckpoint2.pth",
             yolo_model_path="Models/YOLO/best.pt",
             warmup=True
         )

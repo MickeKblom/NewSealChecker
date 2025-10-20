@@ -95,7 +95,7 @@ def _ensure_gi():
 from types_shared import FramePacket
 
 
-class TisCameraWorker(QObject):
+class CameraWorker(QObject):
     ready = Signal()
     error = Signal(str)
     frame_captured = Signal(object)  # FramePacket
