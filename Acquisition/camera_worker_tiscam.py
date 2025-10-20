@@ -100,12 +100,13 @@ class CameraWorker(QObject):
     error = Signal(str)
     frame_captured = Signal(object)  # FramePacket
 
-    def __init__(self, width: int = 640, height: int = 640, exposure_us: int = 29000, timeout_ms: int = 1000):
+    def __init__(self, width: int = 640, height: int = 640, exposure_us: int = 29000, timeout_ms: int = 1000, serial: str = "27420574"):
         super().__init__()
         self.width = width
         self.height = height
         self.exposure_us = exposure_us
         self.timeout = timeout_ms
+        self.serial = serial
 
         self._pipeline: Optional[object] = None
         self._source: Optional[object] = None  # tcambin
@@ -126,6 +127,9 @@ class CameraWorker(QObject):
         source = Gst.ElementFactory.make("tcambin", "source")
         if source is None:
             raise RuntimeError("Failed to create tcambin. Ensure tiscamera is installed.")
+        
+        # Set the camera serial number
+        source.set_property("serial", self.serial)
 
         # Convert and enforce BGR output for downstream consumers
         convert = Gst.ElementFactory.make("videoconvert", "convert")
@@ -135,8 +139,8 @@ class CameraWorker(QObject):
         capsfilter = Gst.ElementFactory.make("capsfilter", "capsfilter")
         if capsfilter is None:
             raise RuntimeError("Failed to create capsfilter.")
-        # Request BGR with specific width/height; framerate left unspecified
-        caps_str = f"video/x-raw,format=BGR,width={self.width},height={self.height}"
+        # Request BGR format; let the camera provide its natural resolution
+        caps_str = "video/x-raw,format=BGR"
         caps = Gst.Caps.from_string(caps_str)
         capsfilter.set_property("caps", caps)
 
@@ -150,8 +154,14 @@ class CameraWorker(QObject):
 
         for elem in (source, convert, capsfilter, appsink):
             pipeline.add(elem)
-        if not Gst.Element.link_many(source, convert, capsfilter, appsink):
-            raise RuntimeError("Failed to link GStreamer elements for tiscamera pipeline.")
+        
+        # Link elements individually for better error handling
+        if not Gst.Element.link(source, convert):
+            raise RuntimeError("Failed to link tcambin to videoconvert.")
+        if not Gst.Element.link(convert, capsfilter):
+            raise RuntimeError("Failed to link videoconvert to capsfilter.")
+        if not Gst.Element.link(capsfilter, appsink):
+            raise RuntimeError("Failed to link capsfilter to appsink.")
 
         self._source = source
         self._appsink = appsink
