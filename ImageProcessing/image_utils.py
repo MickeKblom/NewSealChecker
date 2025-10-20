@@ -246,9 +246,22 @@ def save_segmentation_predictions(image_np, mask_np, base_path, image_id):
 
     # Save image and mask as PNG
     Image.fromarray(image_np).save(os.path.join(imgs_dir, f"{image_id}.png"))
-    mask_to_save = mask_np.astype(np.uint8)
-
-    mask_to_save = (mask_np.astype(np.uint8)) * 255
+    
+    # Convert tensor to numpy if needed
+    if hasattr(mask_np, 'cpu'):  # It's a PyTorch tensor
+        mask_np = mask_np.cpu().numpy()
+    
+    # Fix mask dtype conversion - ensure it's uint8 and properly scaled
+    if mask_np.dtype != np.uint8:
+        if mask_np.max() <= 1.0:
+            # If mask is in [0,1] range, scale to [0,255]
+            mask_to_save = (mask_np * 255).astype(np.uint8)
+        else:
+            # If mask is already in [0,255] range, just convert dtype
+            mask_to_save = mask_np.astype(np.uint8)
+    else:
+        mask_to_save = mask_np
+    
     Image.fromarray(mask_to_save).save(os.path.join(labels_dir, f"{image_id}.png"))
 
     
@@ -313,6 +326,57 @@ def save_cnn_cropped(cropped_img_np, cropped_mask_np, base_path, image_id):
     Image.fromarray(cropped_img_np).save(os.path.join(base_path, "CNN", "cropped_images", f"{image_id}.png"))
     # Save cropped mask
     Image.fromarray(cropped_mask_np).save(os.path.join(base_path, "CNN", "cropped_masks", f"{image_id}.png"))
+
+
+def save_cnn_predictions(cnn_input_img, cnn_input_mask, class_prediction, base_path, image_id):
+    """
+    Save CNN predictions (cropped and resized images and masks) in appropriate folders based on prediction.
+    
+    Args:
+        cnn_input_img: torch.Tensor [C, H, W] - the resized image input to CNN
+        cnn_input_mask: torch.Tensor [H, W] - the resized mask input to CNN  
+        class_prediction: int - 0 for OK, 1 for shorts
+        base_path: str - base directory path
+        image_id: str - unique identifier for the image
+    """
+    # Convert tensors to numpy arrays for saving
+    if isinstance(cnn_input_img, torch.Tensor):
+        # Convert from CHW to HWC and ensure uint8
+        img_np = cnn_input_img.permute(1, 2, 0).cpu().numpy()
+        if img_np.dtype != np.uint8:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
+    else:
+        img_np = cnn_input_img
+    
+    if isinstance(cnn_input_mask, torch.Tensor):
+        mask_np = cnn_input_mask.cpu().numpy()
+        if mask_np.dtype != np.uint8:
+            if mask_np.max() <= 1.0:
+                mask_np = (mask_np * 255).astype(np.uint8)
+            else:
+                mask_np = mask_np.astype(np.uint8)
+    else:
+        mask_np = cnn_input_mask
+    
+    # Determine folder based on prediction
+    folder_name = "OK" if class_prediction == 0 else "shorts"
+    
+    # Create directories
+    cnn_dir = os.path.join(base_path, "CNN", folder_name)
+    images_dir = os.path.join(cnn_dir, "images")
+    masks_dir = os.path.join(cnn_dir, "masks")
+    
+    ensure_dir(images_dir)
+    ensure_dir(masks_dir)
+    
+    # Save image and mask
+    Image.fromarray(img_np).save(os.path.join(images_dir, f"{image_id}.png"))
+    Image.fromarray(mask_np).save(os.path.join(masks_dir, f"{image_id}.png"))
+    
+    print(f"Saved CNN prediction to {folder_name} folder: {image_id}.png (prediction: {class_prediction})")
 
 
 def smooth_mask(mask):
@@ -404,6 +468,64 @@ def mask_to_bbox_torch(mask_tensor):
 def crop_tensor(tensor, bbox):
     xmin, ymin, xmax, ymax = bbox
     return tensor[:, ymin:ymax+1, xmin:xmax+1]  # assuming shape [C, H, W]
+
+
+def crop_to_square_gpu(img_np: np.ndarray, target_size: int = 640) -> np.ndarray:
+    """
+    Crop image to square using GPU acceleration.
+    Takes center crop from any resolution to target_size x target_size (no upscaling).
+    
+    Args:
+        img_np: Input image as numpy array (H, W, C) or (H, W)
+        target_size: Target square size (default 640)
+    
+    Returns:
+        Cropped square image as numpy array (target_size, target_size, C)
+    """
+    import torch
+    
+    # Convert to tensor and move to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Convert numpy to tensor (HWC -> CHW)
+    if img_np.ndim == 3:
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+    else:
+        img_tensor = torch.from_numpy(img_np).float() / 255.0
+    
+    img_tensor = img_tensor.to(device)
+    
+    # Get current dimensions
+    _, height, width = img_tensor.shape
+    
+    # Calculate center crop coordinates for square
+    min_dim = min(height, width)
+    start_h = (height - min_dim) // 2
+    start_w = (width - min_dim) // 2
+    
+    # Crop to square
+    cropped = img_tensor[:, start_h:start_h + min_dim, start_w:start_w + min_dim]
+    
+    # If the square is smaller than target_size, we need to pad or resize
+    if min_dim < target_size:
+        # Pad to target_size
+        pad_h = (target_size - min_dim) // 2
+        pad_w = (target_size - min_dim) // 2
+        cropped = torch.nn.functional.pad(cropped, (pad_w, pad_w, pad_h, pad_h), mode='reflect')
+    elif min_dim > target_size:
+        # Crop to target_size
+        start_crop = (min_dim - target_size) // 2
+        cropped = cropped[:, start_crop:start_crop + target_size, start_crop:start_crop + target_size]
+    
+    # Convert back to numpy (CHW -> HWC)
+    result = cropped.permute(1, 2, 0).cpu().numpy()
+    result = (result * 255).astype(np.uint8)
+    
+    # Convert BGR to RGB for proper color display
+    if result.shape[2] == 3:  # If it's a color image
+        result = result[:, :, [2, 1, 0]]  # BGR -> RGB
+    
+    return result
 
 def resize_tensor(tensor: torch.Tensor, size, mode='nearest', align_corners=False):
     """

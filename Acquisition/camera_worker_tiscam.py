@@ -5,6 +5,7 @@ import os
 from itertools import count
 from typing import Optional
 import numpy as np
+import torch
 from PySide6.QtCore import QObject, Signal, Slot
 
 # GStreamer / TIS camera stack
@@ -93,6 +94,7 @@ def _ensure_gi():
         raise
 
 from types_shared import FramePacket
+from ImageProcessing.image_utils import crop_to_square_gpu
 
 
 class CameraWorker(QObject):
@@ -100,7 +102,7 @@ class CameraWorker(QObject):
     error = Signal(str)
     frame_captured = Signal(object)  # FramePacket
 
-    def __init__(self, width: int = 640, height: int = 640, exposure_us: int = 29000, timeout_ms: int = 1000, serial: str = "27420574"):
+    def __init__(self, width: int = 640, height: int = 640, exposure_us: int = 29000, timeout_ms: int = 5000, serial: str = "27420574"):
         super().__init__()
         self.width = width
         self.height = height
@@ -128,8 +130,10 @@ class CameraWorker(QObject):
         if source is None:
             raise RuntimeError("Failed to create tcambin. Ensure tiscamera is installed.")
         
-        # Set the camera serial number
+        # Set the camera serial number and resolution
         source.set_property("serial", self.serial)
+        # Use 1920x1080 for best quality, then crop to 640x640 (no upscaling)
+        source.set_property("device-caps", "video/x-bayer,format=grbg,width=1920,height=1080")
 
         # Convert and enforce BGR output for downstream consumers
         convert = Gst.ElementFactory.make("videoconvert", "convert")
@@ -283,6 +287,9 @@ class CameraWorker(QObject):
                 # appsink caps enforce BGR, 3 channels
                 array = np.frombuffer(map_info.data, dtype=np.uint8)
                 img = array.reshape((height, width, 3)).copy()
+                
+                # Crop to 640x640 using GPU acceleration
+                img_cropped = crop_to_square_gpu(img, target_size=640)
             finally:
                 buf.unmap(map_info)
         except Exception as e:
@@ -290,7 +297,7 @@ class CameraWorker(QObject):
             return
 
         acq_ms = int((t1 - t0) * 1000)
-        packet = FramePacket(image=img, acq_ms=acq_ms, frame_id=next(self._id_counter))
+        packet = FramePacket(image=img_cropped, acq_ms=acq_ms, frame_id=next(self._id_counter))
         self.frame_captured.emit(packet)
 
     @Slot(int)

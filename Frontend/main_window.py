@@ -5,12 +5,12 @@ from PySide6.QtCore import Slot, Qt, QRect, QThread, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont
 import numpy as np
 from ImageProcessing.inference import ImageInferencePipeline
-from ImageProcessing.image_utils import convert_cv_qt, generate_unique_image_id, save_yolo_predictions, save_segmentation_predictions, save_cnn_cropped
+from ImageProcessing.image_utils import convert_cv_qt, generate_unique_image_id, save_yolo_predictions, save_segmentation_predictions, save_cnn_cropped, save_cnn_predictions
 from Interfaces.ODPredict import ODClassifierWrapper
 from Frontend.settings_dialog import SettingsDialog
 #from Acquisition.camera_worker_webcam import WebcamWorker
-from Acquisition.camera_worker import CameraWorker
-#from Acquisition.camera_worker_tiscam import CameraWorker
+#from Acquisition.camera_worker import CameraWorker
+from Acquisition.camera_worker_tiscam import CameraWorker
 from ImageProcessing.processing_worker import ProcessingWorker
 from Frontend.image_browser import ImageBrowserWindow
 from ImageProcessing.image_utils import generate_class_colors
@@ -372,6 +372,17 @@ class MainWindow(QWidget):
                 save_segmentation_predictions(frame, out.results['segmentation_mask'], base_path, image_id)
             if out.results.get('cropped_img') is not None and out.results.get('cropped_mask') is not None:
                 save_cnn_cropped(out.results['cropped_img'], out.results['cropped_mask'], base_path, image_id)
+            # Save CNN predictions (cropped and resized images/masks) in OK/shorts folders
+            if (out.results.get('cnn_input_img') is not None and 
+                out.results.get('cnn_input_mask') is not None and 
+                out.results.get('class_prediction') is not None):
+                save_cnn_predictions(
+                    out.results['cnn_input_img'], 
+                    out.results['cnn_input_mask'], 
+                    out.results['class_prediction'], 
+                    base_path, 
+                    image_id
+                )
 
         # Re-arm processing-paced live: request a NEW capture (no buffer, no cap)
         self._frame_inflight = False
