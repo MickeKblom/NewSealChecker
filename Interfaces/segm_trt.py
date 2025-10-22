@@ -1,29 +1,29 @@
 import os
 import ctypes
 import ctypes.util
+import time
 from typing import Tuple
 
+import cv2
 import numpy as np
-import time
-import torch
 import tensorrt as trt
+import torch
+
+from ImageProcessing.image_utils import tensor_preprocess
 
 
-# TensorRT logger
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
-def _build_engine_from_onnx(onnx_path: str, fp16: bool = True) -> trt.ICudaEngine:
+def _build_engine_from_onnx(onnx_path: str, input_shape: Tuple[int, int, int, int], fp16: bool = True) -> trt.ICudaEngine:
     if not os.path.exists(onnx_path):
         raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
 
-    # Build serialized network (TensorRT 10.x) then deserialize
     with trt.Builder(TRT_LOGGER) as builder, \
          builder.create_network(flags=1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)) as network, \
          trt.OnnxParser(network, TRT_LOGGER) as parser:
 
         config = builder.create_builder_config()
-        # Keep workspace modest to avoid OOM on Jetson
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 27)  # 128MB
         if fp16 and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
@@ -34,17 +34,14 @@ def _build_engine_from_onnx(onnx_path: str, fp16: bool = True) -> trt.ICudaEngin
                     print(parser.get_error(i))
                 raise RuntimeError("Failed to parse ONNX model")
 
-        # Optimization profile: fix to 1x4x224x512
-        input_tensor = network.get_input(0)
-        target_shape = (1, 4, 224, 512)
+        inp = network.get_input(0)
         profile = builder.create_optimization_profile()
-        profile.set_shape(input_tensor.name, min=target_shape, opt=target_shape, max=target_shape)
+        profile.set_shape(inp.name, min=input_shape, opt=input_shape, max=input_shape)
         config.add_optimization_profile(profile)
 
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
             raise RuntimeError("Engine build failed")
-
         with trt.Runtime(TRT_LOGGER) as runtime:
             engine = runtime.deserialize_cuda_engine(serialized)
         if engine is None:
@@ -66,66 +63,45 @@ def _save_engine(engine: trt.ICudaEngine, engine_path: str) -> None:
         with open(engine_path, 'wb') as f:
             f.write(serialized)
     except Exception:
-        # Best effort; not critical if save fails
         pass
 
 
 class _CudaRt:
-    """Thin ctypes wrapper around CUDA runtime (cudart)."""
     def __init__(self) -> None:
-        libname = ctypes.util.find_library("cudart")
-        if libname is None:
-            # Fallback to standard soname on Jetson
-            libname = "libcudart.so"
+        libname = ctypes.util.find_library("cudart") or "libcudart.so"
         self.lib = ctypes.CDLL(libname)
-
-        # Types
         self.c_void_p = ctypes.c_void_p
         self.c_size_t = ctypes.c_size_t
         self.c_int = ctypes.c_int
-
-        # Functions
         self.cudaMalloc = self.lib.cudaMalloc
         self.cudaMalloc.argtypes = [ctypes.POINTER(self.c_void_p), self.c_size_t]
         self.cudaMalloc.restype = self.c_int
-
         self.cudaFree = self.lib.cudaFree
         self.cudaFree.argtypes = [self.c_void_p]
         self.cudaFree.restype = self.c_int
-
         self.cudaMemcpy = self.lib.cudaMemcpy
         self.cudaMemcpy.argtypes = [self.c_void_p, self.c_void_p, self.c_size_t, self.c_int]
         self.cudaMemcpy.restype = self.c_int
-
         self.cudaStreamCreate = self.lib.cudaStreamCreate
         self.cudaStreamCreate.argtypes = [ctypes.POINTER(self.c_void_p)]
         self.cudaStreamCreate.restype = self.c_int
-
         self.cudaStreamDestroy = self.lib.cudaStreamDestroy
         self.cudaStreamDestroy.argtypes = [self.c_void_p]
         self.cudaStreamDestroy.restype = self.c_int
-
         self.cudaStreamSynchronize = self.lib.cudaStreamSynchronize
         self.cudaStreamSynchronize.argtypes = [self.c_void_p]
         self.cudaStreamSynchronize.restype = self.c_int
-
-        self.cudaDeviceSynchronize = self.lib.cudaDeviceSynchronize
-        self.cudaDeviceSynchronize.argtypes = []
-        self.cudaDeviceSynchronize.restype = self.c_int
-
-        # cudaMemcpyKind
         self.cudaMemcpyHostToDevice = 1
         self.cudaMemcpyDeviceToHost = 2
 
 
 class _TrtRunner:
-    def __init__(self, engine: trt.ICudaEngine):
+    def __init__(self, engine: trt.ICudaEngine, input_shape: Tuple[int, int, int, int]):
         self.engine = engine
         self.context = self.engine.create_execution_context()
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context")
 
-        # New API in TensorRT 10.x
         self.uses_new_api = hasattr(self.engine, 'num_io_tensors')
         if self.uses_new_api:
             names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]
@@ -134,14 +110,11 @@ class _TrtRunner:
         else:
             inputs = [i for i in range(self.engine.num_bindings) if self.engine.binding_is_input(i)]
             outputs = [i for i in range(self.engine.num_bindings) if not self.engine.binding_is_input(i)]
-            if len(inputs) != 1 or len(outputs) != 1:
-                raise RuntimeError("Expected single input and single output binding")
             self.input_index, self.output_index = inputs[0], outputs[0]
             self.input_name = self.engine.get_binding_name(self.input_index)
             self.output_name = self.engine.get_binding_name(self.output_index)
 
-        # Fixed shape matching the optimization profile
-        self.input_shape: Tuple[int, int, int, int] = (1, 4, 224, 512)
+        self.input_shape = input_shape  # (1,3,H,W)
         if self.uses_new_api and hasattr(self.context, 'set_input_shape'):
             self.context.set_input_shape(self.input_name, self.input_shape)
             out_shape = tuple(self.context.get_tensor_shape(self.output_name))
@@ -149,45 +122,37 @@ class _TrtRunner:
             self.context.set_binding_shape(self.input_index, self.input_shape)
             out_shape = tuple(self.context.get_binding_shape(self.output_index))
         if -1 in out_shape:
-            # Fallback if output is still dynamic (should not happen with fixed profile)
-            out_shape = (1, 1)
+            # Assume (1,num_classes,H,W)
+            out_shape = (1, 2, self.input_shape[2], self.input_shape[3])
         self.output_shape = out_shape
 
-        # CUDA runtime
         self.rt = _CudaRt()
-
-        # Allocate device buffers
         self.d_input = self.rt.c_void_p()
         self.d_output = self.rt.c_void_p()
         self.input_bytes = int(np.prod(self.input_shape)) * 4
         self.output_bytes = int(np.prod(self.output_shape)) * 4
-        rc1 = self.rt.cudaMalloc(ctypes.byref(self.d_input), self.input_bytes)
-        rc2 = self.rt.cudaMalloc(ctypes.byref(self.d_output), self.output_bytes)
-        if rc1 != 0 or rc2 != 0:
-            raise RuntimeError(f"cudaMalloc failed: {rc1}, {rc2}")
-
-        # Create non-default stream
+        r1 = self.rt.cudaMalloc(ctypes.byref(self.d_input), self.input_bytes)
+        r2 = self.rt.cudaMalloc(ctypes.byref(self.d_output), self.output_bytes)
+        if r1 != 0 or r2 != 0:
+            raise RuntimeError(f"cudaMalloc failed: {r1},{r2}")
         self.stream = self.rt.c_void_p()
-        rc3 = self.rt.cudaStreamCreate(ctypes.byref(self.stream))
-        if rc3 != 0:
-            raise RuntimeError(f"cudaStreamCreate failed: {rc3}")
+        r3 = self.rt.cudaStreamCreate(ctypes.byref(self.stream))
+        if r3 != 0:
+            raise RuntimeError(f"cudaStreamCreate failed: {r3}")
 
-        print(f"[INFO] TensorRT runner ready: input {self.input_shape}, output {self.output_shape}, stream=0x{int(self.stream.value):x}")
+        print(f"[INFO] TRT Segm runner ready: input {self.input_shape}, output {self.output_shape}, stream=0x{int(self.stream.value):x}")
 
     def infer(self, x_host: np.ndarray) -> np.ndarray:
         if x_host.dtype != np.float32:
             x_host = x_host.astype(np.float32, copy=False)
         if tuple(x_host.shape) != self.input_shape:
-            raise ValueError(f"Input must have shape {self.input_shape}, got {x_host.shape}")
+            raise ValueError(f"Expected input {self.input_shape}, got {x_host.shape}")
 
         y_host = np.empty(self.output_shape, dtype=np.float32)
-
-        # HtoD
         rc = self.rt.cudaMemcpy(self.d_input, ctypes.c_void_p(x_host.ctypes.data), self.input_bytes, self.rt.cudaMemcpyHostToDevice)
         if rc != 0:
             raise RuntimeError(f"cudaMemcpy HtoD failed: {rc}")
 
-        # Set device addresses and run
         if self.uses_new_api and hasattr(self.context, 'set_tensor_address'):
             self.context.set_tensor_address(self.input_name, int(self.d_input.value))
             self.context.set_tensor_address(self.output_name, int(self.d_output.value))
@@ -198,101 +163,153 @@ class _TrtRunner:
             bindings[self.output_index] = int(self.d_output.value)
             ok = self.context.execute_async_v2(bindings=bindings, stream_handle=int(self.stream.value))
         if not ok:
-            raise RuntimeError("TensorRT execution failed")
+            raise RuntimeError("TensorRT inference failed")
 
-        # DtoH
         rc = self.rt.cudaMemcpy(ctypes.c_void_p(y_host.ctypes.data), self.d_output, self.output_bytes, self.rt.cudaMemcpyDeviceToHost)
         if rc != 0:
             raise RuntimeError(f"cudaMemcpy DtoH failed: {rc}")
-
-        # Sync
         self.rt.cudaStreamSynchronize(self.stream)
         return y_host
 
 
-class ODClassifierWrapper:
-    """TensorRT-only OD classifier (loads/builds engine from ONNX) matching original API.
-    init(checkpoint_path, device=None, onnx_path="Models/CNN/best.onnx")
-    Inputs: image_t (HWC/CHW), mask_t (HW/1xHW). Output: int 0/1.
-    """
-    def __init__(self, checkpoint_path: str, device: torch.device | None = None, onnx_path: str | None = "Models/CNN/best.onnx", engine_path: str | None = "Models/CNN/best.trt", fp16: bool = True):
-        # Device here is only for preprocessing tensors; inference is via TensorRT
-        self.device = device if device is not None else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+class SegmentationModelTRT:
+    def __init__(
+        self,
+        onnx_path: str = "Models/Segmentation/best.onnx",
+        engine_path: str = "Models/Segmentation/best.trt",
+        input_size: Tuple[int, int] = (640, 640),
+        num_classes: int = 2,
+        confidence_threshold: float = 0.3,
+        temperature: float = 1.5,
+        src_bgr: bool = True,
+        return_to_input_size: bool = False,
+        fp16: bool = True,
+    ) -> None:
+        self.input_size = tuple(input_size)
+        self.num_classes = int(num_classes)
+        self.confidence_threshold = float(confidence_threshold)
+        self.temperature = float(temperature)
+        self.src_bgr = bool(src_bgr)
+        self.return_to_input_size = bool(return_to_input_size)
 
-        # Load operating threshold from checkpoint only
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
-        self.threshold = float(ckpt.get("thr_at_recall1", 0.5))
-
-        # Preprocessing constants
-        self.normalize_mean = torch.tensor([0.485, 0.456, 0.406, 0.5], device=self.device).view(-1, 1, 1)
-        self.normalize_std = torch.tensor([0.229, 0.224, 0.225, 0.25], device=self.device).view(-1, 1, 1)
-
-        # Load or build engine
-        if engine_path is not None and os.path.exists(engine_path):
+        # Build or load engine
+        input_shape = (1, 3, self.input_size[0], self.input_size[1])
+        if engine_path and os.path.exists(engine_path):
             engine = _load_engine(engine_path)
         else:
-            if onnx_path is None:
-                raise ValueError("onnx_path must be provided to build TensorRT engine")
-            engine = _build_engine_from_onnx(onnx_path, fp16=fp16)
-            if engine_path is not None:
+            engine = _build_engine_from_onnx(onnx_path, input_shape=input_shape, fp16=fp16)
+            if engine_path:
                 _save_engine(engine, engine_path)
-
-        self.runner = _TrtRunner(engine)
-
-    def _prepare_input(self, image_t: torch.Tensor, mask_t: torch.Tensor) -> np.ndarray:
-        img = image_t.to(self.device, non_blocking=True)
-        m = mask_t.to(self.device, non_blocking=True)
-
-        # Ensure CHW for image
-        if img.ndim != 3:
-            raise ValueError("image_t must have 3 dims (HWC or CHW)")
-        if img.shape[0] in (3, 4):
-            img_chw = img
-        else:
-            img_chw = img.permute(2, 0, 1).contiguous()
-
-        # Scale to float [0,1] if integer type
-        if not torch.is_floating_point(img_chw):
-            img_chw = img_chw.float() / 255.0
-
-        # Mask to 1xHxW float in {0,1}
-        if m.ndim == 2:
-            mask_1hw = m.unsqueeze(0)
-        elif m.ndim == 3 and m.shape[0] == 1:
-            mask_1hw = m
-        else:
-            if m.ndim == 3 and m.shape[-1] == 1:
-                mask_1hw = m.permute(2, 0, 1)
-            else:
-                mask_1hw = m.unsqueeze(0)
-        mask_1hw = (mask_1hw > 0).to(img_chw.dtype)
-
-        if img_chw.shape[0] < 3:
-            raise ValueError("image_t must contain 3 color channels")
-        x4 = torch.cat([img_chw[:3, ...], mask_1hw], dim=0)
-        x4 = (x4 - self.normalize_mean) / self.normalize_std
-
-        # Resize to engine profile (224x512)
-        if x4.shape[-2:] != (224, 512):
-            rgb = x4[:3].unsqueeze(0)
-            mask = x4[3:].unsqueeze(0)
-            rgb_resized = torch.nn.functional.interpolate(rgb, size=(224, 512), mode='bilinear', align_corners=False)
-            mask_resized = torch.nn.functional.interpolate(mask, size=(224, 512), mode='nearest')
-            x4 = torch.cat([rgb_resized.squeeze(0), mask_resized.squeeze(0)], dim=0)
-
-        x4 = x4.unsqueeze(0)  # 1,4,224,512
-        return x4.detach().to('cpu', dtype=torch.float32, non_blocking=True).numpy()
+        self.runner = _TrtRunner(engine, input_shape)
 
     @torch.inference_mode()
-    def predict(self, image_t: torch.Tensor, mask_t: torch.Tensor) -> int:
-        x_np = self._prepare_input(image_t, mask_t)
+    def perform_segmentation(self, frame) -> torch.Tensor:
+        # Convert to tensor if numpy
+        if not isinstance(frame, torch.Tensor):
+            frame = torch.from_numpy(frame)
+
+        # Keep original size to optionally restore
+        if frame.ndim == 3:
+            if frame.shape[-1] in (3, 4):  # HWC
+                orig_h, orig_w = frame.shape[0], frame.shape[1]
+            else:  # CHW
+                orig_h, orig_w = frame.shape[-2], frame.shape[-1]
+        else:
+            raise ValueError(f"Expected 3D image tensor/array, got shape {tuple(frame.shape)}")
+
+        # Preprocess (uses same logic as torch model): CHW float normalized
+        x_chw = tensor_preprocess(frame, size=self.input_size, src_bgr=self.src_bgr)  # [C,H,W] torch
+        x_np = x_chw.unsqueeze(0).contiguous().to(torch.float32).cpu().numpy()  # [1,3,H,W]
+
         t0 = time.perf_counter()
-        y = self.runner.infer(x_np)
+        y = self.runner.infer(x_np)  # [1,num_classes,H,W] logits float32
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        logit = float(y.reshape(-1)[0])
-        prob = 1.0 / (1.0 + np.exp(-logit))
-        # Always log execution time
-        print(f"[INFO] TensorRT inference: {dt_ms:.3f} ms (logit={logit:.4f}, prob={prob:.4f})")
-        return int(prob >= self.threshold)
+
+        # Softmax over classes
+        logits = y[0]
+        scaled = logits / max(self.temperature, 1e-6)
+        # softmax along axis=0 (class axis)
+        e = np.exp(scaled - np.max(scaled, axis=0, keepdims=True))
+        probs = e / np.sum(e, axis=0, keepdims=True)
+        confidence = probs.max(axis=0)       # [H,W]
+        predictions = probs.argmax(axis=0)   # [H,W]
+
+        # Confidence threshold -> set to background (0)
+        if self.confidence_threshold > 0:
+            predictions = predictions.copy()
+            predictions[confidence < self.confidence_threshold] = 0
+
+        # Optionally resize back to original size
+        pred = predictions
+        if self.return_to_input_size and (pred.shape[0] != orig_h or pred.shape[1] != orig_w):
+            pred = cv2.resize(pred.astype(np.int32), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+        print(f"[INFO] TRT Segm inference: {dt_ms:.3f} ms")
+        return torch.from_numpy(pred.astype(np.int64))
+
+    @torch.inference_mode()
+    def create_segmentation_overlay(self, frame_bgr, mask: torch.Tensor, alpha: float = 0.3):
+        """Overlay mask on frame (CPU implementation, API-compatible with original).
+        - frame_bgr: np.ndarray HxWx3 (BGR) or torch Tensor (HWC/CHW)
+        - mask: torch.Tensor [H,W] (int64)
+        Returns: np.ndarray HxWx3 (BGR) uint8
+        """
+        # Normalize frame to torch HWC float32 on CPU
+        if not isinstance(frame_bgr, torch.Tensor):
+            frame = torch.from_numpy(frame_bgr)
+        else:
+            frame = frame_bgr
+
+        if frame.ndim != 3:
+            raise ValueError("Expected frame with 3 dims (HWC or CHW)")
+
+        # To HWC
+        if frame.shape[0] in (3, 4):
+            frame = frame.permute(1, 2, 0)
+        frame = frame.to(dtype=torch.float32, device='cpu', non_blocking=False)
+
+        # Ensure 3 channels
+        if frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+
+        # Ensure mask CPU long and resized if needed
+        m = mask.to(dtype=torch.long, device='cpu', non_blocking=False)
+        if m.shape[0] != frame.shape[0] or m.shape[1] != frame.shape[1]:
+            m = torch.from_numpy(cv2.resize(m.cpu().numpy().astype(np.int32), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)).to(torch.long)
+
+        # Simple LUT (BGR)
+        num_colors = max(2, int(m.max().item()) + 1)
+        base_colors = torch.tensor(
+            [
+                [0, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
+                [255, 0, 0],
+                [0, 255, 255],
+                [255, 0, 255],
+                [255, 255, 0],
+            ],
+            dtype=torch.float32,
+        )
+        if num_colors > base_colors.shape[0]:
+            reps = (num_colors + base_colors.shape[0] - 1) // base_colors.shape[0]
+            lut = base_colors.repeat((reps, 1))[:num_colors]
+        else:
+            lut = base_colors[:num_colors]
+
+        colored = lut[m.clamp(min=0, max=num_colors - 1)]  # H,W,3
+
+        # Alpha blend where mask>0
+        alpha_f = float(alpha)
+        out = frame
+        mask3 = (m > 0).unsqueeze(-1)
+        out = torch.where(
+            mask3,
+            frame * (1.0 - alpha_f) + colored * alpha_f,
+            frame,
+        )
+
+        out = out.clamp(0, 255).to(torch.uint8).cpu().numpy()
+        return out
 
 

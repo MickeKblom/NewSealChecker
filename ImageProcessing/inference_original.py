@@ -99,3 +99,5 @@ class ImageInferencePipeline:
             raise NotImplementedError("process_image only supports TORCH backend currently.")
 
         return results
+
+
